@@ -54,9 +54,9 @@ class SimulationConfig:
     discount_rate: float = 0.07
 
     # Sensitivity analysis scenarios
-    price_scenarios: List[float] = field(default_factory=lambda: [0.8, 0.9, 1.0, 1.1, 1.2])
-    volume_scenarios: List[float] = field(default_factory=lambda: [0.8, 0.9, 1.0, 1.1, 1.2])
-    basis_vol_scenarios: List[float] = field(default_factory=lambda: [0.5, 0.75, 1.0, 1.5, 2.0])
+    price_scenarios: List[float] = field(default_factory=lambda: [0.8, 1.2])
+    volume_scenarios: List[float] = field(default_factory=lambda: [0.8, 1.2])
+    basis_vol_scenarios: List[float] = field(default_factory=lambda: [1.2, 1.8])
     p_levels: List[int] = field(default_factory=lambda: [10, 25, 50, 75, 90])
 
 
@@ -74,8 +74,10 @@ class MonteCarloRevenueModel:
 
     def __init__(self, config: SimulationConfig = None):
         self.config = config or SimulationConfig()
-        self.random_state = np.random.RandomState(42)
+        self.base_seed = 42
+        self.random_state = np.random.RandomState(self.base_seed)
         self.results = {}
+        self._simulation_counter = 0  # Track simulations to generate unique seeds
 
     def load_asset_data(self, filepath: str, sheet_name: str) -> AssetData:
         """Load historical data and monthly forecasts from Excel."""
@@ -414,18 +416,22 @@ class MonteCarloRevenueModel:
             (start_date + pd.Timedelta(hours=i)).month, stats['generation']['std'])
             for i in range(total_hours)])
 
-        # Generate simulations
+        # Generate simulations with realistic volatility
+        # Use 50% of historical std dev (was 30%, too conservative)
+        volatility_multiplier = 0.5
         simulated_gen = np.zeros((self.config.n_simulations, total_hours))
         for i in range(self.config.n_simulations):
             noise = self.random_state.normal(0, 1, total_hours)
-            simulated_gen[i] = np.maximum(0, base_gen + noise * monthly_std * 0.3)
+            simulated_gen[i] = np.maximum(0, base_gen + noise * monthly_std * volatility_multiplier)
 
         logger.info(f"  Generation simulated in {time.time()-t0:.2f}s")
+        logger.info(f"    Base mean: {base_gen.mean():.2f} MW, Simulated mean: {simulated_gen.mean():.2f} MW")
+        logger.info(f"    Volatility factor: {volatility_multiplier}, Avg monthly std: {monthly_std.mean():.2f} MW")
         return simulated_gen
 
     def simulate_prices(self, asset: AssetData, stats: Dict, market: str,
                        price_multiplier: float = 1.0,
-                       basis_vol_multiplier: float = 1.0,
+                       basis_vol_multiplier: float = 1.5,
                        neg_price_multiplier: float = 1.0,
                        base_price_hourly: np.ndarray = None) -> np.ndarray:
         """
@@ -470,6 +476,8 @@ class MonteCarloRevenueModel:
                 neg_mask = simulated_prices[i] < 0
                 simulated_prices[i][neg_mask] = simulated_prices[i][neg_mask] * neg_price_multiplier
 
+        logger.info(f"    {market}: Base mean=${base_price.mean():.2f}, Sim mean=${simulated_prices.mean():.2f}, Std=${simulated_prices.std():.2f}")
+        logger.info(f"    Price multiplier applied: {price_multiplier}x")
         return simulated_prices
 
     def simulate_correlated_prices(self, asset: AssetData, stats: Dict,
@@ -566,7 +574,11 @@ class MonteCarloRevenueModel:
                       base_gen_hourly: np.ndarray = None,
                       base_prices_hourly: Dict[str, np.ndarray] = None) -> Dict:
         """Run full Monte Carlo simulation for one asset."""
-        logger.info(f"Running Monte Carlo ({self.config.n_simulations} sims)...")
+        # Generate unique seed for each simulation run to avoid identical results
+        self._simulation_counter += 1
+        seed = self.base_seed + self._simulation_counter * 1000
+        self.random_state = np.random.RandomState(seed)
+        logger.info(f"Running Monte Carlo ({self.config.n_simulations} sims) with seed={seed}...")
         t0_total = time.time()
 
         # Simulate generation
@@ -635,26 +647,26 @@ class MonteCarloRevenueModel:
         logger.info(f"  Total simulation time: {time.time()-t0_total:.2f}s")
         return results
 
-    def sensitivity_analysis(self, asset: AssetData, stats: Dict) -> pd.DataFrame:
-        """Run comprehensive sensitivity analysis."""
+    def sensitivity_analysis(self, base_results: Dict, asset: AssetData, stats: Dict,
+                            base_gen_hourly: np.ndarray,
+                            base_prices_hourly: Dict[str, np.ndarray]) -> pd.DataFrame:
+        """
+        Run comprehensive sensitivity analysis.
+
+        Args:
+            base_results: Results from base case simulation (already calculated)
+            asset: Asset data
+            stats: Historical statistics
+            base_gen_hourly: Pre-expanded hourly generation forecast (reuse from base)
+            base_prices_hourly: Pre-expanded hourly price forecasts (reuse from base)
+        """
         logger.info("Starting sensitivity analysis...")
+        logger.info("  Reusing pre-expanded forecasts and base case results from initial simulation")
         t0_sens = time.time()
 
-        # PRE-EXPAND hourly forecasts once (this is the slow part)
-        logger.info("  Pre-expanding monthly forecasts to hourly (one-time)...")
-        t_expand = time.time()
-        base_gen_hourly = self.expand_monthly_to_hourly(asset, stats, 'Gen_Peak', apply_peak_offpeak=True)
-        base_prices_hourly = {
-            'RT_Hub': self.expand_monthly_to_hourly(asset, stats, 'RT_Hub'),
-            'DA_Hub': self.expand_monthly_to_hourly(asset, stats, 'DA_Hub'),
-        }
-        logger.info(f"  Expansion completed in {time.time()-t_expand:.2f}s - will reuse for all scenarios")
-
         sensitivity_results = []
-        logger.info("  Running base case...")
-        base_results = self.run_simulation(asset, stats,
-                                          base_gen_hourly=base_gen_hourly,
-                                          base_prices_hourly=base_prices_hourly)
+
+        # Use base case results that were already calculated
         base_p25 = base_results['DA_Hub']['fixed_prices']['P25']
 
         # Price sensitivity
@@ -704,7 +716,7 @@ class MonteCarloRevenueModel:
             })
 
         # Negative price sensitivity
-        for neg_mult in [1.0, 2.0, 3.0]:
+        for neg_mult in [2.0, 3.0]:
             results = self.run_simulation(asset, stats, neg_price_mult=neg_mult,
                                          base_gen_hourly=base_gen_hourly,
                                          base_prices_hourly=base_prices_hourly)
@@ -738,13 +750,28 @@ class MonteCarloRevenueModel:
         print(f"Historical mean generation: {stats['generation']['mean']:.2f} MW")
         print(f"Historical mean DA Hub price: ${stats['prices']['DA_Hub']['mean']:.2f}/MWh")
 
-        # Run base simulation
-        print(f"\nRunning {self.config.n_simulations} Monte Carlo simulations...")
-        results = self.run_simulation(asset, stats)
+        # PRE-EXPAND hourly forecasts once (will be reused for base + all sensitivity scenarios)
+        print(f"\nPre-expanding monthly forecasts to hourly (one-time operation)...")
+        logger.info("Pre-expanding monthly forecasts to hourly...")
+        t_expand = time.time()
+        base_gen_hourly = self.expand_monthly_to_hourly(asset, stats, 'Gen_Peak', apply_peak_offpeak=True)
+        base_prices_hourly = {
+            'RT_Hub': self.expand_monthly_to_hourly(asset, stats, 'RT_Hub'),
+            'DA_Hub': self.expand_monthly_to_hourly(asset, stats, 'DA_Hub'),
+        }
+        logger.info(f"Expansion completed in {time.time()-t_expand:.2f}s - will reuse for base + all scenarios")
 
-        # Sensitivity analysis
-        print("Running sensitivity analysis...")
-        sensitivity = self.sensitivity_analysis(asset, stats)
+        # Run base simulation with pre-expanded forecasts
+        print(f"\nRunning base case ({self.config.n_simulations} Monte Carlo simulations)...")
+        results = self.run_simulation(asset, stats,
+                                      base_gen_hourly=base_gen_hourly,
+                                      base_prices_hourly=base_prices_hourly)
+
+        # Sensitivity analysis - reuses base results and pre-expanded forecasts
+        print(f"\nRunning sensitivity analysis (reusing base results and forecasts)...")
+        sensitivity = self.sensitivity_analysis(results, asset, stats,
+                                               base_gen_hourly=base_gen_hourly,
+                                               base_prices_hourly=base_prices_hourly)
 
         # Market comparison metrics
         market_metrics = {
@@ -760,7 +787,9 @@ class MonteCarloRevenueModel:
             'stats': stats,
             'results': results,
             'sensitivity': sensitivity,
-            'market_metrics': market_metrics
+            'market_metrics': market_metrics,
+            'base_gen_hourly': base_gen_hourly,
+            'base_prices_hourly': base_prices_hourly
         }
 
     def save_results(self, analysis: Dict, output_dir: Path):
@@ -807,6 +836,82 @@ class MonteCarloRevenueModel:
 
         # Visualizations
         self.create_visualizations(analysis, output_dir)
+
+        # Forecast expansion visualization
+        self.visualize_expanded_forecasts(
+            asset_name,
+            analysis['base_gen_hourly'],
+            analysis['base_prices_hourly'],
+            output_dir
+        )
+
+    def visualize_expanded_forecasts(self, asset_name: str,
+                                     base_gen_hourly: np.ndarray,
+                                     base_prices_hourly: Dict[str, np.ndarray],
+                                     output_dir: Path):
+        """Visualize the expanded hourly forecasts."""
+        logger.info(f"Creating forecast visualization for {asset_name}...")
+
+        # Create time index
+        start_date = pd.Timestamp(self.config.start_date)
+        hours = len(base_gen_hourly)
+        time_index = pd.date_range(start=start_date, periods=hours, freq='H')
+
+        # Create monthly aggregates for cleaner visualization
+        df = pd.DataFrame({
+            'datetime': time_index,
+            'generation': base_gen_hourly,
+            'rt_hub': base_prices_hourly.get('RT_Hub', np.zeros(hours)),
+            'da_hub': base_prices_hourly.get('DA_Hub', np.zeros(hours)),
+        })
+        df['month'] = df['datetime'].dt.to_period('M')
+        monthly = df.groupby('month').mean()
+        monthly.index = monthly.index.to_timestamp()
+
+        # Create 2x2 subplot
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+        fig.suptitle(f'{asset_name}: Expanded Hourly Forecasts (Monthly Averages)',
+                    fontsize=16, fontweight='bold')
+
+        # Generation forecast
+        ax = axes[0, 0]
+        ax.plot(monthly.index, monthly['generation'], linewidth=2, color='green')
+        ax.set_ylabel('Generation (MW)')
+        ax.set_title('Expected Generation (2026-2030)')
+        ax.grid(alpha=0.3)
+        ax.set_xlabel('Month')
+
+        # RT Hub price
+        ax = axes[0, 1]
+        ax.plot(monthly.index, monthly['rt_hub'], linewidth=2, color='blue')
+        ax.set_ylabel('Price ($/MWh)')
+        ax.set_title('RT Hub Price Forecast')
+        ax.grid(alpha=0.3)
+        ax.set_xlabel('Month')
+
+        # DA Hub price
+        ax = axes[1, 0]
+        ax.plot(monthly.index, monthly['da_hub'], linewidth=2, color='orange')
+        ax.set_ylabel('Price ($/MWh)')
+        ax.set_title('DA Hub Price Forecast')
+        ax.grid(alpha=0.3)
+        ax.set_xlabel('Month')
+
+        # Histogram of hourly generation distribution
+        ax = axes[1, 1]
+        ax.hist(base_gen_hourly, bins=50, alpha=0.7, edgecolor='black', color='green')
+        ax.set_xlabel('Generation (MW)')
+        ax.set_ylabel('Frequency')
+        ax.set_title('Distribution of Hourly Generation Forecast')
+        ax.grid(alpha=0.3)
+        ax.axvline(base_gen_hourly.mean(), color='red', linestyle='--',
+                  linewidth=2, label=f'Mean: {base_gen_hourly.mean():.1f} MW')
+        ax.legend()
+
+        plt.tight_layout()
+        plt.savefig(output_dir / f'{asset_name}_forecast_expansion.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: {output_dir / f'{asset_name}_forecast_expansion.png'}")
+        plt.close()
 
     def create_visualizations(self, analysis: Dict, output_dir: Path):
         """Create comprehensive visualizations."""
