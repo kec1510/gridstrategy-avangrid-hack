@@ -143,6 +143,10 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+.vscode/
+.avangrid_hack/
+CLAUDE.local.md
+.DS_Store
 
 # Spyder project settings
 .spyderproject
